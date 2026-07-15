@@ -50,3 +50,6 @@ node radar_parser_terminal.tsx --list       # show available interfaces
 - Movement execution via simulated clicks or memory writes
 
 See `AGENTS.md` for full specification.
+=======
+# axium-js
+Hybrid bot system for DarkEden
