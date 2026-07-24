@@ -1,7 +1,20 @@
 #!/usr/bin/env node
 
 /**
- * radar_live.js — Bi-Directional DarkEden Terminal Radar
+ * radar_live.js — Live monster list from packet capture
+ *
+ * Captures TCP packets via tshark, parses game entity spawn/move/despawn
+ * packets, and renders a live numbered list of on-screen monsters.
+ * Monsters are removed after 10s of no packets (walked off screen or killed).
+ *
+ * Usage:
+ * node radar_live.js                          # auto-detect interface
+ * node radar_live.js --interface 6            # specify interface number
+ * node radar_live.js --list                   # show available interfaces
+ * node radar_live.js --interface 6 --debug    # verbose packet logging
+ *
+ * Requires:
+ * - Wireshark (tshark) installed
  */
 
 const { spawn, execSync } = require('child_process');
@@ -11,11 +24,8 @@ const path = require('path');
 // ─── Config ────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  playerX: 0, 
-  playerY: 0, 
-  gridSize: 15,
   redrawMs: 100,
-  filter: 'tcp port 9998', 
+  filter: 'tcp port 9998',
   host: '45.55.52.86',
 };
 
@@ -61,69 +71,40 @@ function garbageCollectEntities() {
   if (removed > 0) scheduleRedraw();
 }
 
-// ─── Grid Builder ──────────────────────────────────────────────────────────
+// ─── Renderer ──────────────────────────────────────────────────────────────
 
-function buildGrid() {
-  const size = CONFIG.gridSize;
-  const center = Math.floor(size / 2);
-  const grid = Array.from({ length: size }, () => Array(size).fill('.'));
-  
-  const isPlayerSynced = (CONFIG.playerX > 0 && CONFIG.playerY > 0);
-  grid[center][center] = isPlayerSynced ? 'P' : '?';
+const BOX_W = 40;
 
-  for (const [id, pos] of entities.entries()) {
-    // Only run garbage collection if the player has established a valid coordinate
-    if (isPlayerSynced) {
-      const dx = pos.x - CONFIG.playerX;
-      const dy = pos.y - CONFIG.playerY;
-      
-      if (Math.abs(dx) > 40 || Math.abs(dy) > 40) {
-        entities.delete(id);
-        continue;
-      }
-      
-      const gx = center + dx;
-      const gy = center + dy;
-      if (gx >= 0 && gx < size && gy >= 0 && gy < size) {
-        if (grid[gy][gx] === '.') grid[gy][gx] = pos.initial;
-      }
+function render() {
+  const lines = [];
+  const count = entities.size;
+  const title = ' MONSTERS' + (count > 0 ? ' (' + count + ')' : '') + ' ';
+  const dashes = BOX_W - 2 - title.length;
+  const left = Math.floor(dashes / 2);
+  const right = dashes - left;
+
+  lines.push('\x1b[2J\x1b[H');
+  lines.push('\x1b[37m\u250c' + '\u2500'.repeat(left) + title + '\u2500'.repeat(right) + '\u2510\x1b[0m');
+
+  if (count === 0) {
+    const pad = BOX_W - 10;
+    lines.push('\x1b[37m\u2502\x1b[0m  \x1b[90m(none)\x1b[0m' + ' '.repeat(pad) + '\x1b[37m\u2502\x1b[0m');
+  } else {
+    let idx = 1;
+    for (const [, ent] of entities) {
+      const prefix = ' ' + idx + '. ';
+      const maxName = BOX_W - prefix.length - 4;
+      const name = ent.name.length > maxName ? ent.name.slice(0, maxName - 1) + '\u2026' : ent.name;
+      const pad = BOX_W - prefix.length - name.length - 2;
+      lines.push('\x1b[37m\u2502\x1b[0m' + prefix + '\x1b[33m' + name + '\x1b[0m' + ' '.repeat(Math.max(pad, 0)) + '\x1b[37m\u2502\x1b[0m');
+      idx++;
     }
   }
 
-  return grid;
-}
+  lines.push('\x1b[37m\u2514' + '\u2500'.repeat(BOX_W - 2) + '\u2518\x1b[0m');
 
-// ─── Renderer ──────────────────────────────────────────────────────────────
+  lines.push(' \x1b[90mPackets: ' + totalPackets + '\x1b[0m');
 
-function render() {
-  const grid = buildGrid();
-  const lines = [];
-
-  lines.push('\x1b[H');
-  lines.push('\x1b[37m┌─ RADAR ──────────────────────────────┐\x1b[0m');
-  for (const row of grid) {
-    const cells = row
-      .map(c => {
-        if (c === 'P') return '\x1b[36mP\x1b[0m';
-        if (c === '?') return '\x1b[33m?\x1b[0m';
-        if (c === 'M') return '\x1b[35mM\x1b[0m'; // Ghost entities
-        if (c !== '.') return '\x1b[31m' + c + '\x1b[0m';
-        return '\x1b[90m.\x1b[0m';
-      })
-      .join(' ');
-    lines.push('\x1b[37m│\x1b[0m ' + cells + ' \x1b[37m│\x1b[0m');
-  }
-  lines.push('\x1b[37m└──────────────────────────────────────┘\x1b[0m');
-  
-  const coordStr = (CONFIG.playerX > 0 && CONFIG.playerY > 0) 
-    ? `X: ${CONFIG.playerX}, Y: ${CONFIG.playerY}` 
-    : "WALK TO SYNC COORDINATES";
-
-  lines.push(
-    ` \x1b[90mPos: ${coordStr}  |  ` +
-    `Monsters: ${entities.size}  |  ` +
-    `Total Packets: ${totalPackets}\x1b[0m`
-  );
   if (DEBUG && outboundOpcodes.size > 0) {
     const parts = [];
     for (const [k, v] of outboundOpcodes) parts.push(`${k}:${v}`);
@@ -150,41 +131,8 @@ function parseTcpPayload(payload, srcIp) {
 
     if (length < 0 || length > 10000 || i + 6 + length > payload.length) break; 
 
-    // 1. OUTBOUND PLAYER MOVEMENT (0x0E) - Client to Server
-    if (opcode === 0x0E && length >= 3 && !isFromServer) {
-      const newX = payload[i + 7];
-      const newY = payload[i + 8];
-      
-      if (newX !== 0 && newY !== 0) {
-        CONFIG.playerX = newX;
-        CONFIG.playerY = newY;
-        lastPacketTime = new Date();
-        if (DEBUG) process.stderr.write(`[SYNC] 0x0E: X=${newX}, Y=${newY}\n`);
-      }
-    }
-
-    // 2. OUTBOUND PLAYER MOVEMENT (0x54 alt) - Client to Server
-    else if (opcode === 0x54 && length >= 3 && !isFromServer) {
-      const newX = payload[i + 7];
-      const newY = payload[i + 8];
-      
-      if (newX !== 0 && newY !== 0) {
-        CONFIG.playerX = newX;
-        CONFIG.playerY = newY;
-        lastPacketTime = new Date();
-        if (DEBUG) process.stderr.write(`[SYNC] 0x54: X=${newX}, Y=${newY}\n`);
-      }
-    }
-
-    // 2b. SERVER 0x54 (debug only — coordinate mapping unclear)
-    else if (opcode === 0x54 && length >= 3 && isFromServer && DEBUG) {
-      const x = payload[i + 7];
-      const y = payload[i + 8];
-      process.stderr.write(`[DBG] Server 0x54: X=${x}, Y=${y}\n`);
-    }
-
-    // 3. MONSTER SPAWN (0x2F) - Server to Client
-    else if (opcode === 0x2F && length >= 14 && isFromServer) { 
+    // 1. MONSTER SPAWN (0x2F) - Server to Client
+    if (opcode === 0x2F && length >= 14 && isFromServer) { 
       try {
         const entityId = payload.readUInt32LE(i + 6);
         const nameLen = payload[i + 12];
@@ -192,40 +140,30 @@ function parseTcpPayload(payload, srcIp) {
         if (i + 13 + nameLen + 5 < i + 6 + length) {
           let name = '';
           for (let n = 0; n < nameLen; n++) name += String.fromCharCode(payload[i + 13 + n]);
-          
-          const xOffset = i + 13 + nameLen + 4;
-          const x = payload[xOffset];
-          const y = payload[xOffset + 1];
 
           if (name.length > 0) {
-            entities.set(entityId, { name, x, y, initial: name.charAt(0).toUpperCase(), lastSeen: Date.now() });
+            entities.set(entityId, { name, lastSeen: Date.now() });
             lastPacketTime = new Date();
           }
         }
       } catch (_) {}
     }
 
-    // 4. MONSTER MOVEMENT (0x52) - Server to Client
+    // 2. MONSTER MOVEMENT (0x52) - Server to Client (heartbeat to keep entity alive)
     else if (opcode === 0x52 && length >= 6 && isFromServer) { 
       try {
         const entityId = payload.readUInt32LE(i + 6);
-        const x = payload[i + 10];
-        const y = payload[i + 11];
 
         if (entities.has(entityId)) {
-          const ent = entities.get(entityId);
-          ent.x = x;
-          ent.y = y;
-          ent.lastSeen = Date.now();
+          entities.get(entityId).lastSeen = Date.now();
         } else {
-          // Ghost Registration: Catch pre-existing entities that move
-          entities.set(entityId, { name: 'Unknown', x, y, initial: 'M', lastSeen: Date.now() });
+          entities.set(entityId, { name: 'Unknown', lastSeen: Date.now() });
         }
         lastPacketTime = new Date();
       } catch (_) {}
     }
 
-    // 5. MONSTER DEATH / DESPAWN (0x45) - Server to Client
+    // 3. MONSTER DEATH / DESPAWN (0x45) - Server to Client
     else if (opcode === 0x45 && length >= 4 && isFromServer) {
       try {
         const entityId = payload.readUInt32LE(i + 6);
@@ -236,7 +174,7 @@ function parseTcpPayload(payload, srcIp) {
       } catch (_) {}
     }
 
-    // 6. UNKNOWN OUTBOUND (debug tracking)
+    // 4. UNKNOWN OUTBOUND (debug tracking)
     else if (DEBUG && !isFromServer) {
       try {
         const key = `0x${opcode.toString(16).padStart(2, '0')}`;
