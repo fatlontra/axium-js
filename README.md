@@ -6,7 +6,7 @@ A hybrid bot/radar system for DarkEden MMORPG.
 
 | Layer | Language | Role |
 |---|---|---|
-| **Network Layer** | Node.js | Sniffs TCP packets (port 9998) to maintain a live entity list (monsters, player position) |
+| **Network Layer** | Node.js | Sniffs TCP packets (port 9998) to maintain a live on-screen monster list |
 | **Logic Layer** | Python | Memory reading, map parsing, A* pathfinding, movement execution (planned) |
 
 ## Network Layer (Node.js)
@@ -21,7 +21,7 @@ Passive packet capture via `tshark` (Wireshark CLI). Parses DarkEden binary prot
 
 ### Radar Modes
 
-**Grid Radar** (`radar_live.js`) — 15x15 ANSI color-coded grid centered on the player.
+**Live List** (`radar_live.js`) — Numbered list of on-screen monsters; auto-removes after 10s of no packets.
 
 **List Radar** (`radar_parser_terminal.tsx`) — Boxed numbered list of all detected monsters.
 
@@ -50,6 +50,3 @@ node radar_parser_terminal.tsx --list       # show available interfaces
 - Movement execution via simulated clicks or memory writes
 
 See `AGENTS.md` for full specification.
-=======
-# axium-js
-Hybrid bot system for DarkEden
